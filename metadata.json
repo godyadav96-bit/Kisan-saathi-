@@ -1,0 +1,6 @@
+{
+  "name": "Kisan Saathi – Mandi, Mitti aur Mausam",
+  "description": "Complete Indian Agriculture Assistant for Farmers: Real-time Weather, Mandi Bhav, SoilSense Report Analysis, Crop Advisory, Farming Calculator & Gemini AI Assistance.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

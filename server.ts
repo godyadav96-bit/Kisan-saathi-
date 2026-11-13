@@ -1,4 +1,5 @@
 import express, { Request, Response } from 'express';
+import http from 'http';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 import path from 'path';
@@ -94,8 +95,300 @@ function decodeWeatherCode(code: number) {
   }
 }
 
+// Weather Symbol Code Interpreter for MET Norway
+function decodeMetNoSymbol(symbolCode: string = '', cloudPct: number = 0) {
+  const s = symbolCode.toLowerCase();
+  if (s.includes('thunder')) {
+    return { conditionHi: 'आंधी-तूफान व बिजली', conditionEn: 'Thunderstorm', icon: 'CloudLightning', rainProb: 85 };
+  }
+  if (s.includes('heavyrain')) {
+    return { conditionHi: 'तेज बारिश', conditionEn: 'Heavy Rain', icon: 'CloudRain', rainProb: 90 };
+  }
+  if (s.includes('lightrain') || s.includes('rainshowers')) {
+    return { conditionHi: 'हल्की बारिश / बौछारें', conditionEn: 'Light Rain', icon: 'CloudDrizzle', rainProb: 65 };
+  }
+  if (s.includes('rain')) {
+    return { conditionHi: 'बारिश', conditionEn: 'Rain', icon: 'CloudRain', rainProb: 80 };
+  }
+  if (s.includes('fog')) {
+    return { conditionHi: 'धुंध / कोहरा', conditionEn: 'Fog / Mist', icon: 'CloudFog', rainProb: 15 };
+  }
+  if (s.includes('cloudy') && !s.includes('partly')) {
+    return { conditionHi: 'घने बादल', conditionEn: 'Overcast', icon: 'Cloud', rainProb: 25 };
+  }
+  if (s.includes('partlycloudy') || cloudPct > 45) {
+    return { conditionHi: 'आंशिक बादल', conditionEn: 'Partly Cloudy', icon: 'CloudSun', rainProb: 15 };
+  }
+  if (s.includes('fair') || cloudPct > 15) {
+    return { conditionHi: 'मुख्य रूप से साफ', conditionEn: 'Mainly Clear', icon: 'Sun', rainProb: 5 };
+  }
+  return { conditionHi: 'साफ आसमान', conditionEn: 'Clear Sky', icon: 'Sun', rainProb: 0 };
+}
+
+function buildWarnings(windKmh: number, rainProb: number, todayMax: number): string[] {
+  const warnings: string[] = [];
+  if (windKmh > 30) {
+    warnings.push('तेज हवाओं (30+ किमी/घंटा) की चेतावनी: कीटनाशक छिड़काव व सिंचाई स्थगित रखें।');
+  }
+  if (rainProb > 60) {
+    warnings.push('आगामी 24 घंटे में तेज बारिश की संभावना: खेत से जलनिकासी की तैयारी रखें।');
+  }
+  if (todayMax > 42) {
+    warnings.push('अत्यधिक तापमान (लू) की चेतावनी: फसलों को हल्की सिंचाई दें।');
+  }
+  return warnings;
+}
+
+// Circuit breaker & short-term cache for external weather APIs
+let openMeteoBlockedUntil = 0;
+const serverWeatherCache = new Map<string, { payload: any; timestamp: number }>();
+
+async function fetchOpenMeteoWeather(lat: number, lon: number, district: string) {
+  const openMeteoUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m,wind_direction_10m&hourly=temperature_2m,relative_humidity_2m,precipitation_probability,weather_code&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max&timezone=Asia%2FKolkata&forecast_days=7`;
+
+  const response = await fetch(openMeteoUrl, { signal: AbortSignal.timeout(2800) });
+  if (!response.ok) {
+    throw new Error(`Open-Meteo status ${response.status}`);
+  }
+
+  const data = await response.json();
+  const current = data.current || {};
+  const daily = data.daily || {};
+  const hourly = data.hourly || {};
+
+  const weatherDetails = decodeWeatherCode(current.weather_code ?? 0);
+  const todayMax = daily.temperature_2m_max?.[0] ?? Math.round(current.temperature_2m + 3);
+  const todayMin = daily.temperature_2m_min?.[0] ?? Math.round(current.temperature_2m - 7);
+  const rainProb = daily.precipitation_probability_max?.[0] ?? 0;
+
+  const formattedHourly = [];
+  const currentHourIndex = new Date().getHours();
+  for (let i = currentHourIndex; i < Math.min(currentHourIndex + 24, (hourly.time || []).length); i += 3) {
+    const timeStr = hourly.time?.[i] || '';
+    const hourPart = timeStr.includes('T') ? timeStr.split('T')[1].substring(0, 5) : `${i}:00`;
+    const code = hourly.weather_code?.[i] ?? 0;
+    formattedHourly.push({
+      time: timeStr,
+      hour: hourPart,
+      temp: Math.round(hourly.temperature_2m?.[i] ?? 25),
+      rainProb: hourly.precipitation_probability?.[i] ?? 0,
+      condition: decodeWeatherCode(code).conditionHi,
+      humidity: hourly.relative_humidity_2m?.[i] ?? 50,
+    });
+  }
+
+  const daysOfWeekHindi = ['रविवार', 'सोमवार', 'मंगलवार', 'बुधवार', 'गुरुवार', 'शुक्रवार', 'शनिवार'];
+  const formattedDaily = [];
+  const times = daily.time || [];
+  for (let i = 0; i < times.length; i++) {
+    const dateObj = new Date(times[i]);
+    const dayName = i === 0 ? 'आज' : i === 1 ? 'कल' : daysOfWeekHindi[dateObj.getDay()];
+    const code = daily.weather_code?.[i] ?? 0;
+    const dec = decodeWeatherCode(code);
+    formattedDaily.push({
+      date: times[i],
+      dayName,
+      tempMin: Math.round(daily.temperature_2m_min?.[i] ?? 16),
+      tempMax: Math.round(daily.temperature_2m_max?.[i] ?? 30),
+      rainProb: daily.precipitation_probability_max?.[i] ?? 0,
+      rainfallMm: daily.precipitation_sum?.[i] ?? 0,
+      condition: dec.conditionHi,
+      summary:
+        (daily.precipitation_probability_max?.[i] ?? 0) > 40
+          ? 'बारिश की संभावना, छिड़काव टालें'
+          : 'मौसम साफ, कृषि कार्य जारी रखें',
+    });
+  }
+
+  const windKmh = Math.round(current.wind_speed_10m ?? 0);
+  const warnings = buildWarnings(windKmh, rainProb, todayMax);
+
+  return {
+    current: {
+      temperature: Math.round(current.temperature_2m),
+      feelsLike: Math.round(current.apparent_temperature ?? current.temperature_2m),
+      tempMin: Math.round(todayMin),
+      tempMax: Math.round(todayMax),
+      humidity: current.relative_humidity_2m,
+      windSpeed: windKmh,
+      windDirection: `${Math.round(current.wind_direction_10m ?? 0)}°`,
+      rainProbability: rainProb,
+      expectedRainfallMm: current.precipitation ?? 0,
+      condition: `${weatherDetails.conditionHi} (${weatherDetails.conditionEn})`,
+      conditionCode: current.weather_code,
+      conditionIcon: weatherDetails.icon,
+      summary: `तापमान ${Math.round(current.temperature_2m)}°C, आर्द्रता ${current.relative_humidity_2m}%। ${rainProb > 30 ? 'बारिश के आसार हैं।' : 'मौसम सामान्य बना रहेगा।'}`,
+      source: 'Open-Meteo Global Meteorological Engine (Authorized Open Access)',
+      lastUpdated: new Date().toLocaleTimeString('hi-IN', { timeZone: 'Asia/Kolkata' }),
+      isObserved: true,
+      warnings,
+    },
+    hourly: formattedHourly,
+    daily: formattedDaily,
+    location: district,
+    provider: 'Open-Meteo (IMD-Aligned Coordinates)',
+    isDemo: false,
+  };
+}
+
+async function fetchMetNoWeather(lat: number, lon: number, district: string) {
+  const metUrl = `https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=${lat.toFixed(4)}&lon=${lon.toFixed(4)}`;
+  const response = await fetch(metUrl, {
+    headers: {
+      'User-Agent': 'KisanSaathiApp/1.0 (https://kisansaathi.in)',
+      Accept: 'application/json',
+    },
+    signal: AbortSignal.timeout(5000),
+  });
+
+  if (!response.ok) {
+    throw new Error(`MET Norway status ${response.status}`);
+  }
+
+  const data = await response.json();
+  const timeseries: any[] = data?.properties?.timeseries || [];
+  if (timeseries.length === 0) {
+    throw new Error('MET Norway returned empty timeseries');
+  }
+
+  const nowMs = Date.now();
+  const currentEntry =
+    timeseries.find((item) => new Date(item.time).getTime() >= nowMs - 3600 * 1000) || timeseries[0];
+  const instant = currentEntry?.data?.instant?.details || {};
+  const next1h = currentEntry?.data?.next_1_hours || currentEntry?.data?.next_6_hours || {};
+  const currentSymbol = next1h?.summary?.symbol_code || '';
+  const currentRainMm = next1h?.details?.precipitation_amount ?? 0;
+  const currentDecoded = decodeMetNoSymbol(currentSymbol, instant.cloud_area_fraction ?? 0);
+
+  const dateFmt = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' });
+  const hourFmt = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kolkata',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+
+  // Group entries by Asia/Kolkata date
+  const dayMap = new Map<
+    string,
+    { temps: number[]; rains: number[]; rainProbs: number[]; symbols: string[] }
+  >();
+
+  for (const item of timeseries) {
+    const dt = new Date(item.time);
+    const istDate = dateFmt.format(dt);
+    const det = item.data?.instant?.details;
+    if (!det || typeof det.air_temperature !== 'number') continue;
+
+    const bucket = dayMap.get(istDate) || { temps: [], rains: [], rainProbs: [], symbols: [] };
+    bucket.temps.push(det.air_temperature);
+
+    const period = item.data?.next_1_hours || item.data?.next_6_hours;
+    const precip = period?.details?.precipitation_amount ?? 0;
+    const sym = period?.summary?.symbol_code || '';
+    const symInfo = decodeMetNoSymbol(sym, det.cloud_area_fraction ?? 0);
+
+    bucket.rains.push(precip);
+    bucket.rainProbs.push(precip > 0.2 ? Math.max(symInfo.rainProb, 65) : symInfo.rainProb);
+    if (sym) bucket.symbols.push(sym);
+    dayMap.set(istDate, bucket);
+  }
+
+  const todayIstDate = dateFmt.format(new Date());
+  const todayStats = dayMap.get(todayIstDate);
+  const currentTemp = Math.round(instant.air_temperature ?? 25);
+  const todayMin = todayStats ? Math.round(Math.min(...todayStats.temps)) : currentTemp - 5;
+  const todayMax = todayStats ? Math.round(Math.max(...todayStats.temps)) : currentTemp + 4;
+  const todayRainProb = todayStats
+    ? Math.max(...todayStats.rainProbs)
+    : currentRainMm > 0
+    ? 70
+    : currentDecoded.rainProb;
+
+  // Build next 24 hours (every ~3 hours)
+  const formattedHourly = [];
+  const startIdx = Math.max(0, timeseries.indexOf(currentEntry));
+  for (let i = startIdx; i < Math.min(startIdx + 24, timeseries.length); i += 3) {
+    const item = timeseries[i];
+    const det = item.data?.instant?.details || {};
+    const period = item.data?.next_1_hours || item.data?.next_6_hours || {};
+    const sym = period?.summary?.symbol_code || '';
+    const dec = decodeMetNoSymbol(sym, det.cloud_area_fraction ?? 0);
+    const precip = period?.details?.precipitation_amount ?? 0;
+
+    formattedHourly.push({
+      time: item.time,
+      hour: hourFmt.format(new Date(item.time)),
+      temp: Math.round(det.air_temperature ?? currentTemp),
+      rainProb: precip > 0.2 ? Math.max(dec.rainProb, 65) : dec.rainProb,
+      condition: dec.conditionHi,
+      humidity: Math.round(det.relative_humidity ?? 50),
+    });
+  }
+
+  // Build 7-day forecast
+  const daysOfWeekHindi = ['रविवार', 'सोमवार', 'मंगलवार', 'बुधवार', 'गुरुवार', 'शुक्रवार', 'शनिवार'];
+  const formattedDaily = [];
+  const sortedDates = Array.from(dayMap.keys()).sort().slice(0, 7);
+
+  for (let i = 0; i < sortedDates.length; i++) {
+    const dStr = sortedDates[i];
+    const stats = dayMap.get(dStr)!;
+    const dateObj = new Date(`${dStr}T12:00:00+05:30`);
+    const dayName = i === 0 ? 'आज' : i === 1 ? 'कल' : daysOfWeekHindi[dateObj.getDay()];
+    const midSym = stats.symbols[Math.floor(stats.symbols.length / 2)] || '';
+    const dec = decodeMetNoSymbol(midSym, 20);
+    const maxRainProb = Math.max(...stats.rainProbs);
+    const totalRainMm = Number(stats.rains.reduce((a, b) => a + b, 0).toFixed(1));
+
+    formattedDaily.push({
+      date: dStr,
+      dayName,
+      tempMin: Math.round(Math.min(...stats.temps)),
+      tempMax: Math.round(Math.max(...stats.temps)),
+      rainProb: maxRainProb,
+      rainfallMm: totalRainMm,
+      condition: dec.conditionHi,
+      summary:
+        maxRainProb > 40 ? 'बारिश की संभावना, छिड़काव टालें' : 'मौसम साफ, कृषि कार्य जारी रखें',
+    });
+  }
+
+  const windKmh = Math.round((instant.wind_speed ?? 2) * 3.6);
+  const humidity = Math.round(instant.relative_humidity ?? 45);
+  const warnings = buildWarnings(windKmh, todayRainProb, todayMax);
+
+  return {
+    current: {
+      temperature: currentTemp,
+      feelsLike: currentTemp,
+      tempMin: todayMin,
+      tempMax: todayMax,
+      humidity,
+      windSpeed: windKmh,
+      windDirection: `${Math.round(instant.wind_from_direction ?? 0)}°`,
+      rainProbability: todayRainProb,
+      expectedRainfallMm: currentRainMm,
+      condition: `${currentDecoded.conditionHi} (${currentDecoded.conditionEn})`,
+      conditionCode: 0,
+      conditionIcon: currentDecoded.icon,
+      summary: `तापमान ${currentTemp}°C, आर्द्रता ${humidity}%। ${todayRainProb > 30 ? 'बारिश के आसार हैं।' : 'मौसम सामान्य बना रहेगा।'}`,
+      source: 'MET Norway Global Forecast API (Authorized Open Access)',
+      lastUpdated: new Date().toLocaleTimeString('hi-IN', { timeZone: 'Asia/Kolkata' }),
+      isObserved: true,
+      warnings,
+    },
+    hourly: formattedHourly,
+    daily: formattedDaily,
+    location: district,
+    provider: 'MET Norway (Live Coordinates)',
+    isDemo: false,
+  };
+}
+
 async function startServer() {
   const app = express();
+  const httpServer = http.createServer(app);
   app.use(express.json({ limit: '15mb' }));
 
   // Health check
@@ -110,16 +403,16 @@ async function startServer() {
     });
   });
 
-  // 1. WEATHER API - Real Open-Meteo Integration
+  // 1. WEATHER API - Resilient Multi-Provider Integration (Open-Meteo + MET Norway)
   app.get('/api/weather', async (req: Request, res: Response) => {
-    try {
-      const lat = req.query.lat ? parseFloat(req.query.lat as string) : 26.9124; // Default Jaipur
-      const lon = req.query.lon ? parseFloat(req.query.lon as string) : 75.7873;
-      const district = (req.query.district as string) || 'Jaipur';
-      const isDemo = req.query.demo === 'true';
+    const lat = req.query.lat ? parseFloat(req.query.lat as string) : 26.9124; // Default Jaipur
+    const lon = req.query.lon ? parseFloat(req.query.lon as string) : 75.7873;
+    const district = (req.query.district as string) || 'Jaipur';
+    const isDemo = req.query.demo === 'true';
+    const cacheKey = `${lat.toFixed(2)},${lon.toFixed(2)}`;
 
+    try {
       if (isDemo || dbStore.adminSettings.weatherProvider === 'demo') {
-        // Return structured Demo weather
         return res.json({
           current: {
             temperature: 28,
@@ -135,7 +428,7 @@ async function startServer() {
             conditionCode: 2,
             conditionIcon: 'CloudSun',
             summary: 'दिन में हल्की धूप व आंशिक बादल। शाम को मौसम सुहावना रहेगा।',
-            source: 'DEMO DATA – Open-Meteo Mock Engine',
+            source: 'DEMO DATA – वास्तविक जानकारी नहीं',
             lastUpdated: new Date().toLocaleTimeString('hi-IN'),
             isObserved: true,
             warnings: [],
@@ -158,131 +451,55 @@ async function startServer() {
         });
       }
 
-      // Live Open-Meteo API (Free, reliable, no key needed)
-      const openMeteoUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m,wind_direction_10m&hourly=temperature_2m,relative_humidity_2m,precipitation_probability,weather_code&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max&timezone=Asia%2FKolkata&forecast_days=7`;
-
-      const response = await fetch(openMeteoUrl);
-      if (!response.ok) {
-        throw new Error(`Open-Meteo returned status ${response.status}`);
+      // Return fresh in-memory cache (valid for 10 mins) to stay lightweight & fast
+      const cached = serverWeatherCache.get(cacheKey);
+      if (cached && Date.now() - cached.timestamp < 10 * 60 * 1000) {
+        return res.json({ ...cached.payload, location: district });
       }
 
-      const data = await response.json();
-      const current = data.current || {};
-      const daily = data.daily || {};
-      const hourly = data.hourly || {};
+      let weatherPayload: any = null;
 
-      const weatherDetails = decodeWeatherCode(current.weather_code ?? 0);
-      const todayMax = daily.temperature_2m_max?.[0] ?? Math.round(current.temperature_2m + 3);
-      const todayMin = daily.temperature_2m_min?.[0] ?? Math.round(current.temperature_2m - 7);
-      const rainProb = daily.precipitation_probability_max?.[0] ?? 0;
+      // Try Open-Meteo if configured and not in timeout cooldown
+      if (
+        dbStore.adminSettings.weatherProvider === 'open_meteo' &&
+        Date.now() > openMeteoBlockedUntil
+      ) {
+        try {
+          weatherPayload = await fetchOpenMeteoWeather(lat, lon, district);
+        } catch (err: any) {
+          // Put Open-Meteo into 15-minute cooldown if unreachable from current network
+          openMeteoBlockedUntil = Date.now() + 15 * 60 * 1000;
+          console.warn('Open-Meteo unreachable, switching to MET Norway live provider:', err?.message || 'timeout');
+        }
+      }
 
-      // Extract next 24 hours (every 3 hours)
-      const formattedHourly = [];
-      const currentHourIndex = new Date().getHours();
-      for (let i = currentHourIndex; i < Math.min(currentHourIndex + 24, (hourly.time || []).length); i += 3) {
-        const timeStr = hourly.time?.[i] || '';
-        const hourPart = timeStr.includes('T') ? timeStr.split('T')[1].substring(0, 5) : `${i}:00`;
-        const code = hourly.weather_code?.[i] ?? 0;
-        formattedHourly.push({
-          time: timeStr,
-          hour: hourPart,
-          temp: Math.round(hourly.temperature_2m?.[i] ?? 25),
-          rainProb: hourly.precipitation_probability?.[i] ?? 0,
-          condition: decodeWeatherCode(code).conditionHi,
-          humidity: hourly.relative_humidity_2m?.[i] ?? 50,
+      // Live fallback / primary MET Norway global meteorological API
+      if (!weatherPayload) {
+        weatherPayload = await fetchMetNoWeather(lat, lon, district);
+      }
+
+      serverWeatherCache.set(cacheKey, { payload: weatherPayload, timestamp: Date.now() });
+      return res.json(weatherPayload);
+    } catch (error: any) {
+      console.warn('Live weather providers unreachable:', error?.message || 'network error');
+
+      // Serve last known cached live weather if available
+      const cached = serverWeatherCache.get(cacheKey);
+      if (cached) {
+        return res.json({
+          ...cached.payload,
+          location: district,
+          provider: `${cached.payload.provider} (Cached)`,
+          current: {
+            ...cached.payload.current,
+            isObserved: false,
+          },
         });
       }
 
-      // Format 7-day forecast
-      const daysOfWeekHindi = ['रविवार', 'सोमवार', 'मंगलवार', 'बुधवार', 'गुरुवार', 'शुक्रवार', 'शनिवार'];
-      const formattedDaily = [];
-      const times = daily.time || [];
-      for (let i = 0; i < times.length; i++) {
-        const dateObj = new Date(times[i]);
-        const dayName = i === 0 ? 'आज' : i === 1 ? 'कल' : daysOfWeekHindi[dateObj.getDay()];
-        const code = daily.weather_code?.[i] ?? 0;
-        const dec = decodeWeatherCode(code);
-        formattedDaily.push({
-          date: times[i],
-          dayName,
-          tempMin: Math.round(daily.temperature_2m_min?.[i] ?? 16),
-          tempMax: Math.round(daily.temperature_2m_max?.[i] ?? 30),
-          rainProb: daily.precipitation_probability_max?.[i] ?? 0,
-          rainfallMm: daily.precipitation_sum?.[i] ?? 0,
-          condition: dec.conditionHi,
-          summary:
-            (daily.precipitation_probability_max?.[i] ?? 0) > 40
-              ? 'बारिश की संभावना, छिड़काव टालें'
-              : 'मौसम साफ, कृषि कार्य जारी रखें',
-        });
-      }
-
-      const warnings: string[] = [];
-      if (current.wind_speed_10m > 30) {
-        warnings.push('तेज हवाओं (30+ किमी/घंटा) की चेतावनी: कीटनाशक छिड़काव व सिंचाई स्थगित रखें।');
-      }
-      if (rainProb > 60) {
-        warnings.push('आगामी 24 घंटे में तेज बारिश की संभावना: खेत से जलनिकासी की तैयारी रखें।');
-      }
-      if (todayMax > 42) {
-        warnings.push('अत्यधिक तापमान (लू) की चेतावनी: फसलों को हल्की सिंचाई दें।');
-      }
-
-      return res.json({
-        current: {
-          temperature: Math.round(current.temperature_2m),
-          feelsLike: Math.round(current.apparent_temperature ?? current.temperature_2m),
-          tempMin: Math.round(todayMin),
-          tempMax: Math.round(todayMax),
-          humidity: current.relative_humidity_2m,
-          windSpeed: Math.round(current.wind_speed_10m),
-          windDirection: `${Math.round(current.wind_direction_10m)}°`,
-          rainProbability: rainProb,
-          expectedRainfallMm: current.precipitation ?? 0,
-          condition: `${weatherDetails.conditionHi} (${weatherDetails.conditionEn})`,
-          conditionCode: current.weather_code,
-          conditionIcon: weatherDetails.icon,
-          summary: `तापमान ${Math.round(current.temperature_2m)}°C, आर्द्रता ${current.relative_humidity_2m}%। ${rainProb > 30 ? 'बारिश के आसार हैं।' : 'मौसम सामान्य बना रहेगा।'}`,
-          source: 'Open-Meteo Global Meteorological Engine (Authorized Open Access)',
-          lastUpdated: new Date().toLocaleTimeString('hi-IN', { timeZone: 'Asia/Kolkata' }),
-          isObserved: true,
-          warnings,
-        },
-        hourly: formattedHourly,
-        daily: formattedDaily,
+      return res.status(503).json({
+        error: 'अभी लाइव मौसम सेवा उपलब्ध नहीं है। कृपया थोड़ी देर बाद पुनः प्रयास करें।',
         location: district,
-        provider: 'Open-Meteo (IMD-Aligned Coordinates)',
-        isDemo: false,
-      });
-    } catch (error) {
-      console.error('Weather API error:', error);
-      // Fallback response with notice
-      res.status(200).json({
-        current: {
-          temperature: 26,
-          feelsLike: 26,
-          tempMin: 18,
-          tempMax: 30,
-          humidity: 50,
-          windSpeed: 10,
-          windDirection: 'N',
-          rainProbability: 5,
-          expectedRainfallMm: 0,
-          condition: 'साफ मौसम',
-          conditionCode: 0,
-          conditionIcon: 'Sun',
-          summary: 'मौसम डेटा सर्वर से संपर्क धीमा है। कैश्ड सामान्य डेटा दिखाया जा रहा है।',
-          source: 'Open-Meteo (Offline Cache)',
-          lastUpdated: new Date().toLocaleTimeString('hi-IN'),
-          isObserved: false,
-          warnings: ['लाइव मौसम सर्वर तक पहुंच में विलंब, कृपया दोबारा जांचें।'],
-        },
-        hourly: [],
-        daily: [],
-        location: req.query.district || 'Rajasthan',
-        provider: 'Fallback Cache',
-        isDemo: false,
-        error: 'Live weather service temporarily slow',
       });
     }
   });
@@ -825,7 +1042,12 @@ BEHAVIOR RULES:
   // Serve Frontend
   if (!isProd) {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        allowedHosts: true,
+        // Attach Vite WebSocket to the main HTTP server so browser clients connect over port 3000 instead of unreachable port 24678
+        ws: { server: httpServer },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -837,7 +1059,7 @@ BEHAVIOR RULES:
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`🌾 Kisan Saathi Server running on http://0.0.0.0:${PORT}`);
   });
 }

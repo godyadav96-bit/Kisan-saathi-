@@ -34,10 +34,12 @@ export const HomeDashboard: React.FC = () => {
     setIsChatOpen,
     setSelectedArticle,
     cropsList,
+    triggerManualRefresh,
   } = useApp();
 
   const [weather, setWeather] = useState<WeatherData | null>(null);
   const [weatherLoading, setWeatherLoading] = useState(true);
+  const [weatherError, setWeatherError] = useState<string | null>(null);
   const [mandiPrices, setMandiPrices] = useState<MandiPriceRecord[]>([]);
   const [mandiLoading, setMandiLoading] = useState(true);
   const [recentArticles, setRecentArticles] = useState<FarmingArticle[]>([]);
@@ -48,6 +50,7 @@ export const HomeDashboard: React.FC = () => {
 
     async function loadDashboardData() {
       setWeatherLoading(true);
+      setWeatherError(null);
       setMandiLoading(true);
 
       try {
@@ -63,7 +66,11 @@ export const HomeDashboard: React.FC = () => {
           notificationService.evaluateWeatherAlerts(wRes.data.current, location.district);
         }
       } catch (err) {
-        console.error('Weather load error:', err);
+        console.warn('Weather load unavailable:', err);
+        if (isMounted) {
+          setWeather(null);
+          setWeatherError('लाइव मौसम जानकारी अभी उपलब्ध नहीं है। कृपया इंटरनेट जांचें या पुनः प्रयास करें।');
+        }
       } finally {
         if (isMounted) setWeatherLoading(false);
       }
@@ -190,7 +197,25 @@ export const HomeDashboard: React.FC = () => {
               </span>
             )}
           </div>
-        ) : null}
+        ) : (
+          <div className="py-5 text-center space-y-2.5">
+            <div className="flex items-center justify-center gap-1.5 text-xs font-semibold text-amber-800 bg-amber-50 p-3 rounded-2xl border border-amber-200">
+              <AlertTriangle className="w-4 h-4 shrink-0 text-amber-600" />
+              <span>{weatherError || 'लाइव मौसम जानकारी अभी उपलब्ध नहीं है।'}</span>
+            </div>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                triggerManualRefresh();
+              }}
+              className="inline-flex items-center gap-1.5 text-xs font-bold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 px-3.5 py-2 rounded-xl transition active:scale-95"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>पुनः प्रयास करें</span>
+            </button>
+          </div>
+        )}
       </div>
 
       {/* 3. Six Quick Actions (Large Touch Targets as specified) */}

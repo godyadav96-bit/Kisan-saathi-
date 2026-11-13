@@ -28,10 +28,12 @@ export const MausamDashboard: React.FC = () => {
     refreshKey,
     setIsLocationModalOpen,
     cropsList,
+    triggerManualRefresh,
   } = useApp();
 
   const [weather, setWeather] = useState<WeatherData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [isFromCache, setIsFromCache] = useState(false);
   const [cacheTime, setCacheTime] = useState<string | undefined>(undefined);
 
@@ -48,6 +50,7 @@ export const MausamDashboard: React.FC = () => {
     let isMounted = true;
     async function loadWeather() {
       setLoading(true);
+      setError(null);
       try {
         const res = await api.getWeather(
           location.latitude,
@@ -61,7 +64,11 @@ export const MausamDashboard: React.FC = () => {
           setCacheTime(res.cacheTime);
         }
       } catch (err) {
-        console.error('Weather error:', err);
+        console.warn('Weather unavailable:', err);
+        if (isMounted) {
+          setWeather(null);
+          setError('लाइव मौसम सेवा अभी उपलब्ध नहीं है। कृपया कनेक्शन जांचें या थोड़ी देर बाद पुनः प्रयास करें।');
+        }
       } finally {
         if (isMounted) setLoading(false);
       }
@@ -446,7 +453,29 @@ export const MausamDashboard: React.FC = () => {
             )}
           </div>
         </>
-      ) : null}
+      ) : (
+        <div className="bg-white rounded-3xl border border-amber-200 p-8 text-center space-y-3 shadow-sm">
+          <div className="w-12 h-12 rounded-2xl bg-amber-50 text-amber-600 flex items-center justify-center mx-auto">
+            <AlertTriangle className="w-6 h-6" />
+          </div>
+          <div className="space-y-1">
+            <h3 className="text-sm font-extrabold text-gray-900">
+              मौसम डेटा लोड नहीं हो सका
+            </h3>
+            <p className="text-xs text-gray-600 max-w-md mx-auto">
+              {error || 'लाइव मौसम जानकारी अभी उपलब्ध नहीं है।'}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={triggerManualRefresh}
+            className="inline-flex items-center gap-1.5 text-xs font-bold text-white bg-emerald-700 hover:bg-emerald-800 px-4 py-2.5 rounded-xl shadow-sm transition active:scale-95"
+          >
+            <RefreshCw className="w-4 h-4" />
+            <span>पुनः प्रयास करें</span>
+          </button>
+        </div>
+      )}
     </div>
   );
 };
